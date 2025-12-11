@@ -33,6 +33,7 @@ services:
       - envs/docker.env.overrides
     environment:
       - DOCRAY_HOST=${DOCRAY_HOST}
+      - LITELLM_DROP_PARAMS=true
     ports:
       - "8000:8000"
     command: ["/app/scripts/entrypoint.sh", "/app/scripts/start-api.sh"]
@@ -86,6 +87,7 @@ services:
       - NODE_IP=aperag-celeryworker
       - DOCRAY_HOST=${DOCRAY_HOST}
       - APERAG_API_BASE_URL=http://aperag-api:8000
+      - LITELLM_DROP_PARAMS=true
     command: ["/app/scripts/entrypoint.sh", "/app/scripts/start-celery-worker.sh"]
 
   celerybeat:

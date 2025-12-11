@@ -77,24 +77,64 @@ def chunking_by_token_size(
     overlap_token_size: int = 128,
     max_token_size: int = 1024,
 ) -> list[dict[str, Any]]:
+    """
+    토큰 크기 기반으로 텍스트를 청킹하는 함수
+    
+    Args:
+        tokenizer: 토크나이저 객체
+        content: 청킹할 원본 텍스트
+        split_by_character: 텍스트 분할에 사용할 문자 (선택 사항)
+        split_by_character_only: 문자 분할만 사용할지 여부
+        overlap_token_size: 청크 간 오버랩 토큰 수
+        max_token_size: 청크의 최대 토큰 수
+    
+    Returns:
+        청크 정보를 담은 딕셔너리 리스트
+    """
     tokens = tokenizer.encode(content)
+    total_tokens = len(tokens)
+    
+    logger.info(f"청킹 시작: 총 {total_tokens} 토큰, 최대 청크 크기: {max_token_size}, 오버랩: {overlap_token_size}")
+    
     results: list[dict[str, Any]] = []
+    
     if split_by_character:
         raw_chunks = content.split(split_by_character)
         new_chunks = []
+        
         if split_by_character_only:
             for chunk in raw_chunks:
                 _tokens = tokenizer.encode(chunk)
-                new_chunks.append((len(_tokens), chunk))
+                token_count = len(_tokens)
+                
+                # 토큰 크기가 너무 큰 경우 청크를 더 분할
+                if token_count > max_token_size:
+                    logger.warning(f"문자 분할 청크가 최대 크기를 초과: {token_count} > {max_token_size}")
+                    # 토큰 기반으로 추가 분할
+                    for start in range(0, token_count, max_token_size - overlap_token_size):
+                        end = min(start + max_token_size, token_count)
+                        chunk_content = tokenizer.decode(_tokens[start:end])
+                        new_tokens = len(_tokens[start:end])
+                        new_chunks.append((new_tokens, chunk_content))
+                        logger.debug(f"분할된 청크: {new_tokens} 토큰")
+                else:
+                    new_chunks.append((token_count, chunk))
         else:
             for chunk in raw_chunks:
                 _tokens = tokenizer.encode(chunk)
-                if len(_tokens) > max_token_size:
-                    for start in range(0, len(_tokens), max_token_size - overlap_token_size):
-                        chunk_content = tokenizer.decode(_tokens[start : start + max_token_size])
-                        new_chunks.append((min(max_token_size, len(_tokens) - start), chunk_content))
+                token_count = len(_tokens)
+                
+                if token_count > max_token_size:
+                    logger.warning(f"문자 분할 청크가 최대 크기를 초과하여 분할: {token_count} > {max_token_size}")
+                    for start in range(0, token_count, max_token_size - overlap_token_size):
+                        end = min(start + max_token_size, token_count)
+                        chunk_content = tokenizer.decode(_tokens[start:end])
+                        new_tokens = end - start
+                        new_chunks.append((new_tokens, chunk_content))
+                        logger.debug(f"분할된 청크: {new_tokens} 토큰")
                 else:
-                    new_chunks.append((len(_tokens), chunk))
+                    new_chunks.append((token_count, chunk))
+        
         for index, (_len, chunk) in enumerate(new_chunks):
             results.append(
                 {
@@ -104,15 +144,30 @@ def chunking_by_token_size(
                 }
             )
     else:
-        for index, start in enumerate(range(0, len(tokens), max_token_size - overlap_token_size)):
-            chunk_content = tokenizer.decode(tokens[start : start + max_token_size])
+        # 토큰 기반 청킹
+        for index, start in enumerate(range(0, total_tokens, max_token_size - overlap_token_size)):
+            end = min(start + max_token_size, total_tokens)
+            chunk_tokens = tokens[start:end]
+            chunk_content = tokenizer.decode(chunk_tokens)
+            actual_token_count = len(chunk_tokens)
+            
             results.append(
                 {
-                    "tokens": min(max_token_size, len(tokens) - start),
+                    "tokens": actual_token_count,
                     "content": chunk_content.strip(),
                     "chunk_order_index": index,
                 }
             )
+            
+            logger.debug(f"청크 {index}: {actual_token_count} 토큰")
+    
+    # 청킹 결과 요약 로깅
+    total_chunks = len(results)
+    max_chunk_tokens = max(r["tokens"] for r in results) if results else 0
+    avg_chunk_tokens = sum(r["tokens"] for r in results) / total_chunks if results else 0
+    
+    logger.info(f"청킹 완료: {total_chunks}개 청크 생성, 최대: {max_chunk_tokens} 토큰, 평균: {avg_chunk_tokens:.1f} 토큰")
+    
     return results
 
 

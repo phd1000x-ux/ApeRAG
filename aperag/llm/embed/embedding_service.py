@@ -15,12 +15,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Sequence, Tuple
 
+import httpx
 import litellm
+from redis import Redis
 
+from aperag.config import settings
 from aperag.llm.llm_error_types import (
     BatchProcessingError,
     EmbeddingError,
@@ -50,6 +56,31 @@ class EmbeddingService:
         self.max_workers = 8
         self.multimodal = multimodal
         self.caching = caching
+        
+        # Initialize Redis client for SHA256-based caching
+        self.redis_client = None
+        if self.caching and settings.cache_enabled:
+            try:
+                self.redis_client = Redis(
+                    host=settings.redis_host,
+                    port=settings.redis_port,
+                    password=settings.redis_password,
+                    decode_responses=True
+                )
+                # Test connection
+                self.redis_client.ping()
+                logger.info("Redis client initialized for embedding cache")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Redis client for embedding cache: {e}")
+                self.redis_client = None
+        
+        # Custom embedding models that bypass LiteLLM
+        self.custom_embedding_models = {
+            # Add specific model combinations that should use direct HTTP requests
+            # Format: "provider/model": True
+            # Examples will be added based on specific requirements
+            "openai/cohere.embed-multilingual-v3": True,  # Use direct HTTP for this model to avoid embedding_types issue
+        }
 
     def embed_documents(self, contents: List[str]) -> List[List[float]]:
         """
@@ -64,13 +95,23 @@ class EmbeddingService:
         # Validate inputs
         if not contents:
             raise EmptyTextError(0)
-
+        
         # Check for empty contents
         empty_indices = [i for i, text in enumerate(contents) if not text or not text.strip()]
         if empty_indices:
             logger.warning(f"Found {len(empty_indices)} empty content at indices: {empty_indices}")
             if len(empty_indices) == len(contents):
                 raise EmptyTextError(len(empty_indices))
+        
+        # Special handling for dimension probe to avoid base64 encoding issues
+        # Check if this is a dimension probe request
+        is_dimension_probe = all(text == "dimension_probe" for text in contents if text)
+        
+        if is_dimension_probe:
+            # Use a simpler, ASCII-only text for dimension probing
+            # This avoids base64 encoding issues with certain providers
+            logger.info("Using ASCII-only text for dimension probe to avoid encoding issues")
+            contents = ["dimension_probe"]  # Override with ASCII-only version
 
         try:
             # Clean contents by replacing newlines with spaces
@@ -164,7 +205,7 @@ class EmbeddingService:
 
     def _embed_batch(self, batch: Sequence[str]) -> List[List[float]]:
         """
-        Embed a batch of contents using litellm.
+        Embed a batch of contents using either direct HTTP requests or litellm.
 
         Args:
             batch: Sequence of contents to embed
@@ -175,16 +216,46 @@ class EmbeddingService:
         Raises:
             EmbeddingError: If embedding fails
         """
-
+        model_key = f"{self.embedding_provider}/{self.model}"
+        
+        # Check if we should use direct HTTP requests for this model
+        if model_key in self.custom_embedding_models or self._should_use_direct_http():
+            return self._embed_batch_direct_http(batch)
+        
+        # Check SHA256-based cache first
+        if self.redis_client:
+            cached_embeddings = self._get_from_cache(batch)
+            if cached_embeddings:
+                logger.debug(f"Cache hit for batch of {len(batch)} items")
+                return cached_embeddings
+        
+        # Use LiteLLM for embedding
         try:
-            response = litellm.embedding(
-                custom_llm_provider=self.embedding_provider,
-                model=self.model,
-                api_base=self.api_base,
-                api_key=self.api_key,
-                input=list(batch),
-                caching=self.caching,
-            )
+            # Prepare request parameters
+            request_params = {
+                "custom_llm_provider": self.embedding_provider,
+                "model": self.model,
+                "api_base": self.api_base,
+                "api_key": self.api_key,
+                "input": list(batch),
+                "caching": self.caching,
+                # Drop all extra parameters to avoid encoding issues
+                "drop_params": True,
+            }
+            
+            # Remove all Cohere-specific parameters to avoid base64 encoding issues
+            # These parameters are causing the base64 encoding error
+            # if self.embedding_provider == "bedrock" and "cohere" in self.model.lower():
+            #     request_params["embedding_types"] = ["float"]
+            #     # Remove input_type parameter to avoid base64 encoding issues
+            #     # request_params["input_type"] = "search_document"
+            # # Also add for openai provider when using cohere models through bedrock
+            # elif self.embedding_provider == "openai" and "cohere" in self.model.lower():
+            #     request_params["embedding_types"] = ["float"]
+            #     # Remove input_type parameter to avoid base64 encoding issues
+            #     # request_params["input_type"] = "search_document"
+            
+            response = litellm.embedding(**request_params)
 
             if not response or "data" not in response:
                 raise EmbeddingError(
@@ -199,8 +270,184 @@ class EmbeddingService:
                 dimensions = [len(emb) for emb in embeddings]
                 logger.warning(f"Inconsistent embedding dimensions: {set(dimensions)}")
 
+            # Cache the results using SHA256
+            if self.redis_client and embeddings:
+                self._cache_embeddings(batch, embeddings)
+
             return embeddings
         except Exception as e:
             logger.error(f"Batch embedding API call failed: {str(e)}")
             # Convert litellm errors to our custom types
             raise wrap_litellm_error(e, "embedding", self.embedding_provider, self.model) from e
+    
+    def _should_use_direct_http(self) -> bool:
+        """
+        Determine if direct HTTP requests should be used instead of LiteLLM.
+        
+        Returns:
+            bool: True if direct HTTP should be used
+        """
+        # Add logic to determine when to use direct HTTP requests
+        # This can be based on provider, model, or other conditions
+        direct_http_providers = ["custom_provider1", "custom_provider2"]  # Add as needed
+        return self.embedding_provider in direct_http_providers
+    
+    def _embed_batch_direct_http(self, batch: Sequence[str]) -> List[List[float]]:
+        """
+        Embed a batch using direct HTTP requests, bypassing LiteLLM.
+        
+        Args:
+            batch: Sequence of contents to embed
+            
+        Returns:
+            List of embedding vectors
+            
+        Raises:
+            EmbeddingError: If embedding fails
+        """
+        # Check SHA256-based cache first
+        if self.redis_client:
+            cached_embeddings = self._get_from_cache(batch)
+            if cached_embeddings:
+                logger.debug(f"Cache hit for direct HTTP batch of {len(batch)} items")
+                return cached_embeddings
+        
+        try:
+            # Prepare request based on provider
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            data = {
+                "model": self.model,
+                "input": list(batch)
+            }
+            
+            # Remove all Cohere-specific parameters to avoid base64 encoding issues
+            # These parameters are causing the base64 encoding error
+            # if self.embedding_provider == "bedrock" and "cohere" in self.model.lower():
+            #     data["embedding_types"] = ["float"]
+            #     # Remove input_type parameter to avoid base64 encoding issues
+            #     # data["input_type"] = "search_document"
+            # # Also add for openai provider when using cohere models through bedrock
+            # elif self.embedding_provider == "openai" and "cohere" in self.model.lower():
+            #     data["embedding_types"] = ["float"]
+            #     # Remove input_type parameter to avoid base64 encoding issues
+            #     # data["input_type"] = "search_document"
+            
+            # Make direct HTTP request
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    f"{self.api_base}/embeddings",
+                    headers=headers,
+                    json=data
+                )
+                response.raise_for_status()
+                
+                result = response.json()
+                
+                if "data" not in result:
+                    raise EmbeddingError(
+                        "Invalid response format from direct HTTP embedding API",
+                        {"provider": self.embedding_provider, "model": self.model, "response": result},
+                    )
+                
+                embeddings = [item["embedding"] for item in result["data"]]
+                
+                # Validate embedding dimensions
+                if embeddings and len(set(len(emb) for emb in embeddings)) > 1:
+                    dimensions = [len(emb) for emb in embeddings]
+                    logger.warning(f"Inconsistent embedding dimensions: {set(dimensions)}")
+                
+                # Cache the results using SHA256
+                if self.redis_client and embeddings:
+                    self._cache_embeddings(batch, embeddings)
+                
+                return embeddings
+                
+        except httpx.HTTPError as e:
+            logger.error(f"Direct HTTP embedding request failed: {str(e)}")
+            raise EmbeddingError(
+                f"Direct HTTP embedding request failed: {str(e)}",
+                {"provider": self.embedding_provider, "model": self.model},
+            ) from e
+        except Exception as e:
+            logger.error(f"Direct HTTP embedding failed: {str(e)}")
+            raise EmbeddingError(
+                f"Direct HTTP embedding failed: {str(e)}",
+                {"provider": self.embedding_provider, "model": self.model},
+            ) from e
+    
+    def _generate_cache_key(self, texts: Sequence[str]) -> str:
+        """
+        Generate SHA256 hash-based cache key for the given texts.
+        
+        Args:
+            texts: Sequence of texts to embed
+            
+        Returns:
+            str: SHA256 hash-based cache key
+        """
+        # Create a deterministic string from all inputs
+        cache_data = {
+            "provider": self.embedding_provider,
+            "model": self.model,
+            "texts": list(texts)
+        }
+        cache_string = json.dumps(cache_data, sort_keys=True)
+        return hashlib.sha256(cache_string.encode()).hexdigest()
+    
+    def _get_from_cache(self, batch: Sequence[str]) -> List[List[float]] | None:
+        """
+        Retrieve embeddings from SHA256-based cache.
+        
+        Args:
+            batch: Sequence of texts to embed
+            
+        Returns:
+            List of embedding vectors or None if not found
+        """
+        if not self.redis_client:
+            return None
+        
+        try:
+            cache_key = f"embedding:{self._generate_cache_key(batch)}"
+            cached_data = self.redis_client.get(cache_key)
+            
+            if cached_data:
+                cache_entry = json.loads(cached_data)
+                logger.debug(f"Cache hit for key: {cache_key}")
+                return cache_entry["embeddings"]
+            
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to retrieve from cache: {e}")
+            return None
+    
+    def _cache_embeddings(self, batch: Sequence[str], embeddings: List[List[float]]) -> None:
+        """
+        Cache embeddings using SHA256-based key.
+        
+        Args:
+            batch: Sequence of texts that were embedded
+            embeddings: List of embedding vectors to cache
+        """
+        if not self.redis_client:
+            return
+        
+        try:
+            cache_key = f"embedding:{self._generate_cache_key(batch)}"
+            cache_data = {
+                "embeddings": embeddings,
+                "timestamp": time.time(),
+                "provider": self.embedding_provider,
+                "model": self.model
+            }
+            
+            # Cache with TTL from settings
+            ttl = getattr(settings, 'cache_ttl', 3600)  # Default 1 hour
+            self.redis_client.setex(
+                cache_key,
+                ttl,
+                json.dumps(cache_data)
+            )
+            logger.debug(f"Cached embeddings with key: {cache_key}")
+        except Exception as e:
+            logger.warning(f"Failed to cache embeddings: {e}")

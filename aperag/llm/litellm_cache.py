@@ -23,12 +23,31 @@ This module configures LiteLLM's built-in caching functionality with:
 """
 
 import logging
+import os
 from typing import Any, Dict
 
 import litellm
 from litellm.types.caching import LiteLLMCacheType
 
 logger = logging.getLogger(__name__)
+
+# Configure litellm drop_params from environment variables
+# This must be set before any litellm API calls
+if os.getenv("LITELLM_DROP_PARAMS", "").lower() == "true":
+    litellm.drop_params = True
+    logger.info("LiteLLM drop_params enabled from LITELLM_DROP_PARAMS environment variable")
+
+# Also try parsing LITELLM_SETTINGS JSON
+litellm_settings_str = os.getenv("LITELLM_SETTINGS")
+if litellm_settings_str:
+    try:
+        import json
+        litellm_settings = json.loads(litellm_settings_str)
+        if litellm_settings.get("drop_params"):
+            litellm.drop_params = True
+            logger.info("LiteLLM drop_params enabled from LITELLM_SETTINGS environment variable")
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning(f"Failed to parse LITELLM_SETTINGS: {e}")
 
 # Local in-memory statistics
 # Note: These are simple integer operations that may not be thread-safe
@@ -75,14 +94,31 @@ def disable_litellm_cache():
 
 def setup_custom_get_cache_key():
     def custom_get_cache_key(*args, **kwargs):
-        # return key to use for your cache:
-        key = (
-            kwargs.get("model", "")
-            + str(kwargs.get("messages", ""))
-            + str(kwargs.get("temperature", ""))
-            + str(kwargs.get("logit_bias", ""))
-        )
-        print("key for cache", key)
+        # Generate SHA256-based cache key for better performance and collision avoidance
+        import hashlib
+        import json
+        
+        # Create a deterministic string from all relevant parameters
+        cache_data = {
+            "model": kwargs.get("model", ""),
+            "messages": kwargs.get("messages", ""),
+            "temperature": kwargs.get("temperature", ""),
+            "logit_bias": kwargs.get("logit_bias", ""),
+            "max_tokens": kwargs.get("max_tokens", ""),
+            "top_p": kwargs.get("top_p", ""),
+            "frequency_penalty": kwargs.get("frequency_penalty", ""),
+            "presence_penalty": kwargs.get("presence_penalty", ""),
+        }
+        
+        # For embeddings, include the input texts
+        if "input" in kwargs:
+            cache_data["input"] = kwargs.get("input", [])
+        
+        # Create deterministic string and hash it
+        cache_string = json.dumps(cache_data, sort_keys=True)
+        key = hashlib.sha256(cache_string.encode()).hexdigest()
+        
+        logger.debug(f"Generated SHA256 cache key: {key[:16]}...")
         return key
 
     if litellm.cache is not None:

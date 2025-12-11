@@ -117,6 +117,7 @@ def _get_embedding_model(
             embedding_service_api_key,
             embedding_max_chunks_in_batch,
             multimodal=multimodal,
+            caching=settings.cache_enabled,
         )
         embedding_dim = _get_embedding_dimension(embedding_svc, embedding_provider, embedding_model)
         return embedding_svc, embedding_dim

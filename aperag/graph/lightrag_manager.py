@@ -15,6 +15,8 @@
 import asyncio
 import logging
 import os
+import re
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import numpy
@@ -38,15 +40,15 @@ logger = logging.getLogger(__name__)
 class LightRAGConfig:
     """Centralized configuration for LightRAG"""
 
-    CHUNK_TOKEN_SIZE = 1200
-    CHUNK_OVERLAP_TOKEN_SIZE = 100
+    CHUNK_TOKEN_SIZE = 1024
+    CHUNK_OVERLAP_TOKEN_SIZE = 128
     LLM_MODEL_MAX_ASYNC = 20
     COSINE_BETTER_THAN_THRESHOLD = 0.2
     MAX_BATCH_SIZE = 32
     ENTITY_EXTRACT_MAX_GLEANING = 0
     SUMMARY_TO_MAX_TOKENS = 2000
     FORCE_LLM_SUMMARY_ON_MERGE = 10
-    EMBEDDING_MAX_TOKEN_SIZE = 8192
+    EMBEDDING_MAX_TOKEN_SIZE = 2048
     DEFAULT_LANGUAGE = "The same language like input text"
 
 
@@ -253,8 +255,78 @@ async def _gen_embed_func(
         embedding_svc, dim = get_collection_embedding_service_sync(collection)
 
         async def embed_func(texts: list[str]) -> numpy.ndarray:
-            embeddings = await embedding_svc.aembed_documents(texts)
-            return numpy.array(embeddings)
+            """
+            Embed texts with retry logic for token limit errors.
+            
+            This function handles token limit errors by:
+            1. Detecting token length limit errors
+            2. Splitting long texts into smaller chunks
+            3. Retrying with exponential backoff
+            4. Providing detailed error logging
+            """
+            max_retries = 3
+            base_delay = 1.0  # Base delay in seconds
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    embeddings = await embedding_svc.aembed_documents(texts)
+                    return numpy.array(embeddings)
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    # Check if this is a token limit error
+                    is_token_limit_error = (
+                        "maxLength" in error_msg and "actual" in error_msg or
+                        "token" in error_msg.lower() and "limit" in error_msg.lower() or
+                        "too long" in error_msg.lower() or
+                        "maximum" in error_msg.lower() and "length" in error_msg.lower()
+                    )
+                    
+                    if is_token_limit_error and attempt < max_retries:
+                        # Extract token limit information if available
+                        token_limit_match = re.search(r"maxLength:\s*(\d+)", error_msg)
+                        actual_length_match = re.search(r"actual:\s*(\d+)", error_msg)
+                        
+                        if token_limit_match:
+                            max_tokens = int(token_limit_match.group(1))
+                            logger.warning(f"Token limit error detected (attempt {attempt + 1}/{max_retries + 1}): "
+                                         f"limit={max_tokens}, actual={actual_length_match.group(1) if actual_length_match else 'unknown'}")
+                        else:
+                            logger.warning(f"Token limit error detected (attempt {attempt + 1}/{max_retries + 1}): {error_msg}")
+                        
+                        # Apply exponential backoff
+                        delay = base_delay * (2 ** attempt)
+                        logger.info(f"Retrying in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        
+                        # Split texts into smaller chunks and retry
+                        try:
+                            # Use the embedding service's _split_long_texts method if available
+                            if hasattr(embedding_svc, '_split_long_texts'):
+                                split_texts = embedding_svc._split_long_texts(texts)
+                            else:
+                                # Fallback splitting logic
+                                split_texts = _fallback_split_texts(texts, max_tokens if token_limit_match else 1024)
+                            
+                            logger.info(f"Split {len(texts)} texts into {len(split_texts)} chunks for retry")
+                            embeddings = await embedding_svc.aembed_documents(split_texts)
+                            return numpy.array(embeddings)
+                            
+                        except Exception as split_error:
+                            logger.error(f"Text splitting failed: {str(split_error)}")
+                            # Continue to next retry attempt
+                            continue
+                    else:
+                        # Not a token limit error or max retries reached
+                        if attempt == max_retries:
+                            logger.error(f"Max retries ({max_retries}) exceeded for embedding. Last error: {error_msg}")
+                        else:
+                            logger.error(f"Embedding failed (attempt {attempt + 1}): {error_msg}")
+                        raise
+
+            # This should not be reached, but just in case
+            raise LightRAGError("Embedding failed after all retry attempts")
 
         return embed_func, dim
     except (ProviderNotFoundError, EmbeddingError) as e:
@@ -264,6 +336,44 @@ async def _gen_embed_func(
     except Exception as e:
         logger.error(f"Failed to create embedding function: {str(e)}")
         raise LightRAGError(f"Failed to create embedding function: {str(e)}") from e
+
+
+def _fallback_split_texts(texts: List[str], max_tokens: int) -> List[str]:
+    """
+    Fallback text splitting function when embedding service's _split_long_texts is not available.
+    
+    Args:
+        texts: List of texts to split
+        max_tokens: Maximum token size per chunk
+        
+    Returns:
+        List of split text chunks
+    """
+    split_texts = []
+    
+    for text in texts:
+        if not text or not text.strip():
+            split_texts.append(" ")
+            continue
+            
+        # Simple character-based splitting as fallback
+        # Approximate 1 token ≈ 4 characters for most models
+        max_chars = max_tokens * 4
+        overlap = max_chars // 4  # 25% overlap
+        
+        if len(text) <= max_chars:
+            split_texts.append(text)
+        else:
+            # Split with overlap
+            for start in range(0, len(text), max_chars - overlap):
+                end = min(start + max_chars, len(text))
+                chunk = text[start:end]
+                split_texts.append(chunk)
+                
+                if end >= len(text):
+                    break
+    
+    return split_texts
 
 
 async def _gen_llm_func(collection: Collection) -> Callable[..., Awaitable[str]]:
