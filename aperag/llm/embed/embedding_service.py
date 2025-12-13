@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Sequence, Tuple
@@ -313,11 +314,14 @@ class EmbeddingService:
                 return cached_embeddings
         
         try:
+            # Sanitize content before sending to API
+            sanitized_batch = [self._sanitize_content(text) for text in batch]
+
             # Prepare request based on provider
             headers = {"Authorization": f"Bearer {self.api_key}"}
             data = {
                 "model": self.model,
-                "input": list(batch)
+                "input": sanitized_batch
             }
             
             # Remove all Cohere-specific parameters to avoid base64 encoding issues
@@ -374,7 +378,34 @@ class EmbeddingService:
                 f"Direct HTTP embedding failed: {str(e)}",
                 {"provider": self.embedding_provider, "model": self.model},
             ) from e
-    
+
+    def _sanitize_content(self, text: str) -> str:
+        """
+        Sanitize content before sending to embedding API.
+
+        Args:
+            text: Text to sanitize
+
+        Returns:
+            str: Sanitized text
+        """
+        if not text:
+            return text
+
+        # Replace non-breaking spaces with regular spaces
+        sanitized = text.replace('\xa0', ' ')
+
+        # Replace other problematic Unicode characters
+        sanitized = sanitized.replace('\u200b', '')  # Zero-width space
+        sanitized = sanitized.replace('\u200c', '')  # Zero-width non-joiner
+        sanitized = sanitized.replace('\u200d', '')  # Zero-width joiner
+        sanitized = sanitized.replace('\ufeff', '')  # BOM
+
+        # Normalize multiple spaces to single space
+        sanitized = re.sub(r' +', ' ', sanitized)
+
+        return sanitized.strip()
+
     def _generate_cache_key(self, texts: Sequence[str]) -> str:
         """
         Generate SHA256 hash-based cache key for the given texts.

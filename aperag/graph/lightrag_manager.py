@@ -274,7 +274,19 @@ async def _gen_embed_func(
                     
                 except Exception as e:
                     error_msg = str(e)
-                    
+
+                    # Check if this is a connection error (retryable without text splitting)
+                    is_connection_error = (
+                        "Connection refused" in error_msg or
+                        "Connection error" in error_msg or
+                        "[Errno 111]" in error_msg or
+                        "ConnectionError" in error_msg or
+                        "ConnectionResetError" in error_msg or
+                        "ServerDisconnectedError" in error_msg or
+                        "timeout" in error_msg.lower() or
+                        "timed out" in error_msg.lower()
+                    )
+
                     # Check if this is a token limit error
                     is_token_limit_error = (
                         "maxLength" in error_msg and "actual" in error_msg or
@@ -282,7 +294,15 @@ async def _gen_embed_func(
                         "too long" in error_msg.lower() or
                         "maximum" in error_msg.lower() and "length" in error_msg.lower()
                     )
-                    
+
+                    # Retry on connection errors (without text splitting)
+                    if is_connection_error and attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(f"Connection error detected (attempt {attempt + 1}/{max_retries + 1}): {error_msg[:200]}")
+                        logger.info(f"Retrying in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        continue
+
                     if is_token_limit_error and attempt < max_retries:
                         # Extract token limit information if available
                         token_limit_match = re.search(r"maxLength:\s*(\d+)", error_msg)
@@ -413,11 +433,39 @@ async def _gen_llm_func(collection: Collection) -> Callable[..., Awaitable[str]]
             if history_messages:
                 messages.extend(history_messages)
 
-            full_response = await completion_service.agenerate(
-                history=messages, prompt=prompt, images=[], memory=bool(messages)
-            )
+            # Retry logic for connection errors
+            max_retries = 3
+            base_delay = 1.0
 
-            return full_response
+            for attempt in range(max_retries + 1):
+                try:
+                    full_response = await completion_service.agenerate(
+                        history=messages, prompt=prompt, images=[], memory=bool(messages)
+                    )
+                    return full_response
+
+                except Exception as e:
+                    error_msg = str(e)
+
+                    is_connection_error = (
+                        "Connection refused" in error_msg or
+                        "Connection error" in error_msg or
+                        "[Errno 111]" in error_msg or
+                        "ConnectionError" in error_msg or
+                        "ConnectionResetError" in error_msg or
+                        "ServerDisconnectedError" in error_msg or
+                        "timeout" in error_msg.lower() or
+                        "timed out" in error_msg.lower()
+                    )
+
+                    if is_connection_error and attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(f"LLM connection error (attempt {attempt + 1}/{max_retries + 1}): {error_msg[:200]}")
+                        logger.info(f"Retrying in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        continue
+
+                    raise
 
         return llm_func
 

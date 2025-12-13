@@ -88,6 +88,7 @@ services:
       - DOCRAY_HOST=${DOCRAY_HOST}
       - APERAG_API_BASE_URL=http://aperag-api:8000
       - LITELLM_DROP_PARAMS=true
+      - EMBEDDING_MAX_CHUNKS_IN_BATCH=3
     command: ["/app/scripts/entrypoint.sh", "/app/scripts/start-celery-worker.sh"]
 
   celerybeat:
