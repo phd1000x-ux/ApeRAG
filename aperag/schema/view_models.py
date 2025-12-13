@@ -72,9 +72,9 @@ class KnowledgeGraphConfig(BaseModel):
     """
 
     language: Optional[str] = Field(
-        'English',
+        'The same language like input text',
         description='Language for entity extraction and query responses',
-        examples=['English'],
+        examples=['English', 'Korean', 'The same language like input text'],
     )
     entity_types: Optional[list[str]] = Field(
         [
@@ -114,7 +114,7 @@ class CollectionConfig(BaseModel):
     knowledge_graph_config: Optional[KnowledgeGraphConfig] = Field(
         default_factory=lambda: KnowledgeGraphConfig.model_validate(
             {
-                'language': 'English',
+                'language': 'The same language like input text',
                 'entity_types': [
                     'organization',
                     'person',
