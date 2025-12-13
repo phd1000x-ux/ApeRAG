@@ -156,8 +156,9 @@ services:
       - aperag-redis-data:/data
     ports:
       - "6379:6379"
+    command: redis-server --requirepass password
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      test: ["CMD-SHELL", "redis-cli -a password ping | grep PONG"]
       interval: 10s
       timeout: 3s
       retries: 5
