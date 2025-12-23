@@ -138,3 +138,14 @@ make compose-down REMOVE_VOLUMES=1        # Stop and delete data
 
 ### Wrong Entity Language
 Check Collection's `knowledge_graph_config.language` setting - should be "The same language like input text"
+
+## Change Log
+
+### 2024-12-23: Knowledge Graph 언어 기본값 수정
+- **문제**: 한글 문서를 graph index 시 엔티티가 영어로 추출됨
+- **원인**: `collection.yaml`의 `knowledge_graph_config.language` 기본값이 "English"로 설정되어 있었음
+- **해결**: 기본값을 "The same language like input text"로 변경
+- **수정 파일**:
+  - `aperag/api/components/schemas/collection.yaml` (라인 119, 120, 160)
+  - `aperag/schema/view_models.py` (make generate-models로 자동 생성)
+- **참고**: 기존에 생성된 Collection은 DB에 저장된 값("English")이 유지됨. 새로 생성되는 Collection에만 적용됨.

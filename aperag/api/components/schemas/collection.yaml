@@ -116,8 +116,8 @@ knowledgeGraphConfig:
     language:
       type: string
       description: Language for entity extraction and query responses
-      default: "English"
-      example: "English"
+      default: "The same language like input text"
+      example: "The same language like input text"
     entity_types:
       type: array
       items:
@@ -157,7 +157,7 @@ collectionConfig:
       allOf:
         - $ref: '#/knowledgeGraphConfig'
       default:
-        language: "English"
+        language: "The same language like input text"
         entity_types: ["organization", "person", "geo", "event", "product", "technology", "date", "category"]
     embedding:
       $ref: './model.yaml#/modelSpec'
